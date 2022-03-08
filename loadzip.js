@@ -1,4 +1,4 @@
-﻿// loadzip.js
+// loadzip.js
 // ==============================================================================================
 // Load application from .zip file
 'use strict'
@@ -40,7 +40,7 @@ setTimeout(function () {                        // setImmediate (for compatibili
             statSync: function (path, options) { return zhas(path) ? z.statSync(zsub) : FS.statSync(path, options) },
             object: z, root: zroot              // class object, root path
         }
-        patchRequire(global.$ZFS)               // local code below instead of require('fs-monkey').patchRequire()
+        patchRequire(global.$ZFS, true)         // local code below instead of require('fs-monkey').patchRequire()
     } catch (err) { Log('ENOENT' === err.code ? 'not found: ' + file : err.toString()) }
     require(file.slice(0, -Path.extname(file).length) + '.js')
 }, 0)
@@ -178,24 +178,11 @@ if (!Buffer.prototype.from) Buffer.prototype.from = function (p1, p2, p3) { if (
 
 //-----------------------------------------------------------------------------------------------
 // fs-monkey patchRequire https://github.com/streamich/fs-monkey#readme
+//
+// modified by Tobias Kiertscher <dev@mastersign.de>
+// to layer given virtual filesystem over real filesystem
 const path = Path, Module = require('module')
 function correctPath(p) { return p }
-//
-//Object.defineProperty(exports, "__esModule", {
-//    value: true
-//});
-//exports.default = patchRequire;
-//
-//var _path = require('path');
-//
-//var path = _interopRequireWildcard(_path);
-//
-//function _interopRequireWildcard(obj) { if (obj && obj.__esModule) { return obj; } else { var newObj = {}; if (obj != null) { for (var key in obj) { if (Object.prototype.hasOwnProperty.call(obj, key)) newObj[key] = obj[key]; } } newObj.default = obj; return newObj; } }
-//
-//var isWin32 = process.platform === 'win32';
-//var correctPath = isWin32 ? require('./correctPath').correctPath : function (p) {
-//    return p;
-//};
 
 function stripBOM(content) {
     if (content.charCodeAt(0) === 0xFEFF) {
@@ -204,56 +191,77 @@ function stripBOM(content) {
     return content;
 }
 
-function patchRequire(vol) {
-//
-//    var unixifyPaths = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : false;
-//    var Module = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : require('module');
-//
-//    if (isWin32 && unixifyPaths) {
-//        var original = vol;
-//        vol = {
-//            readFileSync: function readFileSync(path, options) {
-//                return original.readFileSync(correctPath(path), options);
-//            },
-//
-//            realpathSync: function realpathSync(path) {
-//                return original.realpathSync(correctPath(path));
-//            },
-//
-//            statSync: function statSync(path) {
-//                return original.statSync(correctPath(path));
-//            }
-//        };
-//    }
-//
-    function internalModuleReadFile(path) {
+function patchRequire(vol, overlay) {
+
+    function readTextFile(path) {
+        let content;
         try {
-            return vol.readFileSync(path, 'utf8');
-        } catch (err) { }
+            content = vol.readFileSync(path, 'utf8');
+            // console.log(`readTextFile('${path}') -> ZIP`);
+        } catch (err) {
+            if (overlay && err.code === 'ENOENT') {
+                path = path.replace(/^\\\\\?\\/, '');
+                try {
+                    content = FS.readFileSync(path, 'utf8');
+                    // console.log(`readTextFile('${path}') -> FS`);
+                } catch (err) {
+                    // console.log(`readTextFile('${path}') -> ERROR FS: ${err.code}`);
+                    throw err;
+                }
+            } else {
+                // console.log(`readTextFile('${path}') -> ERROR ZIP: ${err.code}`);
+                throw err;
+            }
+        }
+        return content;
     }
 
-    function internalModuleStat(filename) {
+    function readTextFileOrUndefined(path) {
         try {
-            return vol.statSync(filename).isDirectory() ? 1 : 0;
+            return readTextFile(path);
         } catch (err) {
+            return undefined;
+        }
+    }
+
+    function moduleStat(filename) {
+        try {
+            const rc = vol.statSync(filename).isDirectory() ? 1 : 0;
+            // console.log(`moduleStat('${filename}') -> ZIP ${rc}`);
+            return rc;
+        } catch (err) {
+            if (overlay && err.code === 'ENOENT') {
+                filename = filename.replace(/^\\\\\?\\/, '');
+                try {
+                    const rc = FS.statSync(filename).isDirectory() ? 1 : 0;
+                    // console.log(`moduleStat('${filename}') -> FS ${rc}`);
+                    return rc;
+                } catch (err) {
+                    if (err.code === 'ENOENT') {
+                        // console.log(`moduleStat('${filename}') -> NOT FOUND`);
+                    } else {
+                        // console.log(`moduleStat('${filename}') -> ERROR FS: ${err.code}`);
+                    }
+                    return -2;
+                }
+            } else {
+                // console.log(`moduleStat('${filename}') -> ERROR ZIP: ${err.code}`);
+            }
             return -2;
         }
     }
 
     function stat(filename) {
-//        filename = path._makeLong(filename);
         var cache = stat.cache;
         if (cache !== null) {
             var _result = cache.get(filename);
             if (_result !== undefined) return _result;
         }
-        var result = internalModuleStat(filename);
+        var result = moduleStat(filename);
         if (cache !== null) cache.set(filename, result);
         return result;
     }
     stat.cache = null;
-
-    var preserveSymlinks = false;
 
     function toRealPath(requestPath) {
         return vol.realpathSync(requestPath);
@@ -262,12 +270,16 @@ function patchRequire(vol) {
     var packageMainCache = Object.create(null);
     function readPackage(requestPath) {
         var entry = packageMainCache[requestPath];
-        if (entry) return entry;
+        if (entry) {
+            // console.log(`readPackage('${requestPath}') -> ${entry} (cached)`);
+            return entry;
+        }
 
         var jsonPath = path.resolve(requestPath, 'package.json');
-        var json = internalModuleReadFile(path._makeLong(jsonPath));
+        var json = readTextFileOrUndefined(path._makeLong(jsonPath));
 
         if (json === undefined) {
+            // console.log(`readPackage('${requestPath}') -> ${jsonPath} -> not found`);
             return false;
         }
 
@@ -279,21 +291,24 @@ function patchRequire(vol) {
             e.message = 'Error parsing ' + jsonPath + ': ' + e.message;
             throw e;
         }
+        // console.log(`readPackage('${requestPath}') -> ${jsonPath} -> ${pkg}`);
         return pkg;
     }
 
     function tryFile(requestPath, isMain) {
         var rc = stat(requestPath);
-        if (preserveSymlinks && !isMain) {
+        // console.log('tryFile:', requestPath, isMain, ' -> ', rc);
+        if (!isMain) {
             return rc === 0 && path.resolve(requestPath);
         }
         return rc === 0 && toRealPath(requestPath);
     }
 
     function tryExtensions(p, exts, isMain) {
+        // console.log('tryExtensions:', p, exts, isMain);
         for (var i = 0; i < exts.length; i++) {
             var filename = tryFile(p + exts[i], isMain);
-
+            // console.log(`tryExtensions(${exts[i]}) -> ${filename}`)
             if (filename) {
                 return filename;
             }
@@ -302,21 +317,27 @@ function patchRequire(vol) {
     }
 
     function tryPackage(requestPath, exts, isMain) {
+        // console.log('tryPackage:', requestPath, exts, isMain, '...');
         var pkg = readPackage(requestPath);
 
-        if (!pkg) return false;
+        if (!pkg) {
+            // console.log('tryPackage:', requestPath, '-> NO PACKAGE');
+            return false;
+        }
 
         var filename = path.resolve(requestPath, pkg);
-        return tryFile(filename, isMain) || tryExtensions(filename, exts, isMain) || tryExtensions(path.resolve(filename, 'index'), exts, isMain);
+        const result = tryFile(filename, isMain) || tryExtensions(filename, exts, isMain) || tryExtensions(path.resolve(filename, 'index'), exts, isMain);
+        // console.log('tryPackage:', requestPath, '->', result);
+        return result;
     }
 
     Module._extensions['.js'] = function (module, filename) {
-        var content = vol.readFileSync(filename, 'utf8');
+        const content = readTextFile(filename);
         module._compile(stripBOM(content), filename);
     };
 
     Module._extensions['.json'] = function (module, filename) {
-        var content = vol.readFileSync(filename, 'utf8');
+        const content = readTextFile(filename);
         try {
             module.exports = JSON.parse(stripBOM(content));
         } catch (err) {
@@ -325,22 +346,30 @@ function patchRequire(vol) {
         }
     };
 
-    //+++++
     Module._extensions['.node'] = function (module, filename) {
         filename = filename.replace(/\\/g, '/')
         if (filename.substr(0, vol.root.length) == vol.root) {
-            var tmp = Path.join(require('os').tmpdir(), 'loadzip') + '/', buf = vol.readFileSync(filename)
+            const tmp = Path.join(require('os').tmpdir(), 'loadzip') + '/';
+            const buf = readTextFile(filename);
             filename = filename.replace(/:/, '').replace(/\//g, '_').replace(/_node_modules_/g, '$')
-            try { if (!buf.equals(FS.readFileSync(tmp + filename))) throw 'write' }
-            catch (e) { try { FS.mkdirSync(tmp) } catch (e) { }; FS.writeFileSync(tmp + filename, buf) }
-            filename = tmp + filename
+            try {
+                if (!buf.equals(FS.readFileSync(tmp + filename))) throw 'write';
+            } catch (err) {
+                try {
+                    FS.mkdirSync(tmp)
+                } catch (err) {
+                    // ignore
+                };
+                FS.writeFileSync(tmp + filename, buf);
+            }
+            filename = tmp + filename;
         }
-        return process.dlopen(module, filename)
+        return process.dlopen(module, filename);
     }
-    //-----
 
     var warned = true;
     Module._findPath = function (request, paths, isMain) {
+        // console.log(`_findPath('${request}',`, paths, ')');
         if (path.isAbsolute(request)) {
             paths = [''];
         } else if (!paths || paths.length === 0) {
@@ -363,7 +392,7 @@ function patchRequire(vol) {
             var rc = stat(basePath);
             if (!trailingSlash) {
                 if (rc === 0) {
-                    if (preserveSymlinks && !isMain) {
+                    if (!isMain) {
                         filename = path.resolve(basePath);
                     } else {
                         filename = toRealPath(basePath);
